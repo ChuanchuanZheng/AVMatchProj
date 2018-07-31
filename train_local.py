@@ -1,7 +1,6 @@
 # -*- coding:utf-8 -*-
 from frame_level_models import NetVLAD
 import tensorflow as tf
-from tensorflow.contrib.framework.python.ops.variables import get_or_create_global_step
 import numpy as np
 import os,sys
 import traceback
@@ -12,6 +11,7 @@ import tensorflow.contrib.slim as slim
 from tensorflow import flags
 from tensorflow import app
 from tensorflow import logging
+import math
 os.environ['CUDA_VISIBLE_DEVICES'] = '1,2'
 
 FLAGS = flags.FLAGS
@@ -54,6 +54,8 @@ def resize_axis(tensor,axis,new_size,fill_value=0):
 
 def build_model_inference(video_input,audio_input):
     
+    video_input = tf.convert_to_tensor(video_input)
+    audio_input = tf.convert_to_tensor(audio_input)
     reshaped_video_input = tf.reshape(video_input,[-1,1024])
     reshaped_audio_input = tf.reshape(audio_input,[-1,128])
 
@@ -74,7 +76,9 @@ def build_model_inference(video_input,audio_input):
 
 def input_pipeline(tfrecords_dir,file_pattern):
     tfrecords_list = glob.glob(os.path.join(tfrecords_dir,file_pattern))
-    train_file_num = len(tfrecords_list)
+    train_file_num = int(len(tfrecords_list) * 0.9)
+    tfrecords_list = tfrecords_list[0:train_file_num]
+
     filename_queue = tf.train.string_input_producer(tfrecords_list,num_epochs=FLAGS.num_epochs)
     reader = tf.TFRecordReader()
     _,serialized_example = reader.read(filename_queue)
@@ -93,7 +97,7 @@ def input_pipeline(tfrecords_dir,file_pattern):
     video_batch_data,audio_batch_data = tf.train.batch(
             tensors=[video_decoded_features,audio_decoded_features],
             batch_size=FLAGS.batch_size,
-            num_threads = 5,
+            num_threads = 10,
             capacity = 4 * FLAGS.batch_size,
             allow_smaller_final_batch = True,
             dynamic_pad=True)
@@ -169,12 +173,14 @@ def main(unused_argv):
         l2_loss += tf.nn.l2_loss(graph.get_tensor_by_name('audio_fc/audio_fc_3/weights:0'))
         l2_loss += tf.nn.l2_loss(graph.get_tensor_by_name('audio_fc/audio_fc_3/biases:0'))
         
-        video_vec = tf.nn.dropout(video_vec, FLAGS.dropout_keep_prob)
-        audio_vec = tf.nn.dropout(audio_vec, FLAGS.dropout_keep_prob)
-        loss_op = closs(video_vec,audio_vec,l2_loss=l2_loss,neg=FLAGS.NEG,l2_reg_lambda = FLAGS.l2_reg_lambda)
+        video_vec_dp = tf.nn.dropout(video_vec, FLAGS.dropout_keep_prob)
+        audio_vec_dp = tf.nn.dropout(audio_vec, FLAGS.dropout_keep_prob)
+        
+        loss_op = closs(video_vec_dp,audio_vec_dp,l2_loss=l2_loss,neg=FLAGS.NEG,l2_reg_lambda = FLAGS.l2_reg_lambda)
         
         # Optimizer
-        global_step = tf.train.get_or_create_global_step()
+        tf.summary.scalar('loss',loss_op)
+        global_step = tf.Variable(0,name='global_step',trainable=False)
 
         lr = tf.train.exponential_decay(
                 learning_rate = FLAGS.initial_lr,
@@ -187,37 +193,46 @@ def main(unused_argv):
         train_op = slim.learning.create_train_op(loss_op,optimizer)
 
         summary = tf.summary.merge_all()
-
-        def train_step(sess,train_op,global_step):
-            start_time = time.time()
-            total_loss,global_step_count = sess.run([train_op,global_step])
-            time_elapsed = time.time() - start_time
-
-            logging.info("global step %s: loss: %.4f(%.2f sec/step)",global_step_count,total_loss,time_elapsed)
-            return total_loss,global_step_count 
-
-        sv = tf.train.Supervisor(logdir = FLAGS.log_dir,summary_op=summary,global_step=global_step,save_model_secs = 600, save_summaries_secs = 60)
         
+        saver = tf.train.Saver()
         tf_config = tf.ConfigProto()
         tf_config.gpu_options.allow_growth = True
-        
-        with sv.managed_session(config=tf_config) as sess:
-            for step in xrange(num_steps_per_epoch * FLAGS.num_epochs):
-                if step % num_batches_per_epoch == 0:
-                    logging.info('Epoch %s/%s',step/num_batches_per_epoch+1,FLAGS.num_epochs)
-                    learning_rate_value = sess.run([lr])
-                    logging.info('Current Learning Rate: %s',learning_rate_value)
-                """
-                # print op names in the graph 
-                for op in tf.get_default_graph().get_operations():
-                    print op.name
-                """
-                logging.info('Current Step: %s',sv.global_step)
-                loss,_ = train_step(sess,train_op,sv.global_step) 
-                logging.info('Loss: %s',loss)
-            logging.info('Final loss:%s',loss)
-            logging.info('finished.')
-            #sv.stop()
+        sess = tf.Session(config=tf_config)
+        sess.run(tf.global_variables_initializer())
+        sess.run(tf.local_variables_initializer())
+        coord = tf.train.Coordinator()
+        threads = tf.train.start_queue_runners(sess=sess,coord=coord)
+        try:
+            while not coord.should_stop():
+                # Instantiate a SummaryWriter to output summaries and the Graph.
+                summary_writer = tf.summary.FileWriter(FLAGS.log_dir, sess.graph)
+                for step in xrange(num_steps_per_epoch * FLAGS.num_epochs):
+                    if step % num_batches_per_epoch == 0:
+                        logging.info('Epoch %s/%s',step/num_batches_per_epoch+1,FLAGS.num_epochs)
+                        lr_value = sess.run([lr])
+                        logging.info('Current Learning Rate: %s',lr_value)
+                    _,loss_value = sess.run([train_op,loss_op])
+                    if step % 100 == 0:
+                        logging.info('Step %s: loss = %.4f',step,loss_value)
+                        summary_str = sess.run(summary)
+                        summary_writer.add_summary(summary_str,step)
+                        summary_writer.flush()
+                    
+                    vvec = sess.run([video_vec])
+                    logging.info('vvec:%s',vvec)
+                    #bv = graph.get_operation_by_name('video_fc/video_fc_3/biases').outputs[0]
+                    #logging.info('bias v:%s',sess.run(bv))
+
+                    if (step + 1) % 1000 == 0 or (step + 1) == FLAGS.num_epochs * num_steps_per_epoch:
+                        checkpoint_file = os.path.join(FLAGS.log_dir,'model.ckpt')
+                        saver.save(sess,checkpoint_file,global_step=step)
+
+        except tf.errors.OutOfRangeError:
+            logging.info('OutOfRangeError')
+        finally:
+            coord.request_stop()
+        coord.request_stop()
+        coord.join(threads)
 
 if __name__ == '__main__':
     app.run()
